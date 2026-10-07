@@ -74,6 +74,11 @@ wrong in a way that will mislead someone). Linters and humans own those.
 Every finding must point at a specific `path:line` in this PR and say concretely what goes wrong and
 when. If you cannot name the failure, it is not a finding. When in doubt, leave it out.
 
+Your memory of third-party APIs (GitHub, cloud SDKs, libraries) may be stale or wrong, and you cannot
+check it from here. Do not claim that a field, type, endpoint or option does not exist unless the
+checkout itself (vendored code, pinned dependencies, schema files, docs in the repo) shows it. If the
+code has a comment asserting the API's behavior, trust it unless the repo contradicts it.
+
 ## 3. Answer with the verdict
 
 Your **final message** is parsed, so it must start with the verdict line. Use `approve` when you
