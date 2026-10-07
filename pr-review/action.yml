@@ -1,0 +1,274 @@
+name: 'Pi PR Review'
+description: 'Review a pull request with Pi and post one review: approve or request changes (or a plain comment), collapsing its older reviews.'
+author: 'hank-warren'
+
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+# The agent never writes to GitHub. The action prefetches the PR (metadata,
+# diff, earlier reviews) into a directory, the agent reads that and the checkout
+# and writes review.md + result.json, and a separate step posts exactly one
+# review pinned to the reviewed commit and collapses this identity's older ones.
+#
+# Check out the PR before this action (actions/checkout on a pull_request event
+# does), ideally with `persist-credentials: false`.
+
+inputs:
+  cliproxyapi-api-key:
+    description: 'CLIProxyAPI client key. Required.'
+    required: true
+  cliproxyapi-base-url:
+    description: 'CLIProxyAPI OpenAI-compatible base URL, including /v1, e.g. https://cpa.example.com/v1. Must be reachable from the runner.'
+    required: true
+  pr-number:
+    description: 'Pull request to review.'
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repository:
+    description: 'owner/name of the pull request''s repository. The checkout in the working directory must be this repository.'
+    required: false
+    default: ${{ github.repository }}
+  mode:
+    description: >-
+      `verdict` (default) approves a clean PR and requests changes on one with findings.
+      `comment` posts the same review as a plain COMMENT that never blocks a merge.
+    required: false
+    default: 'verdict'
+  github-token:
+    description: >-
+      Token that posts the review (needs pull-requests: write), used when no App is configured. The
+      agent never receives it. Approving with GITHUB_TOKEN needs the repo setting "Allow GitHub
+      Actions to create and approve pull requests"; without it an approval is posted as a comment.
+    required: false
+    default: ${{ github.token }}
+  app-client-id:
+    description: 'GitHub App Client ID. When set, the review posts as <app-slug>[bot] and the agent gets a read-only App token for gh reads.'
+    required: false
+    default: ''
+  app-private-key:
+    description: 'GitHub App private key. Required when app-client-id is set.'
+    required: false
+    default: ''
+  dry-run:
+    description: 'Run the agent but post nothing; the planned review goes to the step summary.'
+    required: false
+    default: 'false'
+  model:
+    description: 'Gateway model.'
+    required: false
+    default: 'cpa/gpt-6.1-sol'
+  fallback-models:
+    description: 'Ordered fallback gateway models, comma- or newline-separated.'
+    required: false
+    default: 'cpa/claude-opus-5-5'
+  thinking:
+    description: 'Thinking level.'
+    required: false
+    default: 'high'
+  tools:
+    description: >-
+      Agent tool allowlist. The default has no bash: everything the review needs is prefetched, and
+      bash would expose the gateway key to commands the model runs. Add bash only for trusted PRs.
+    required: false
+    default: 'read,grep,find,ls,write'
+  max-turns:
+    description: 'Assistant turn cap.'
+    required: false
+    default: '40'
+  timeout-minutes:
+    description: 'Wall-clock limit for the agent.'
+    required: false
+    default: '20'
+  on-rate-limit:
+    description: '`skip` (default) posts nothing and exits 0 when gateway quota is exhausted; `fail` fails the step.'
+    required: false
+    default: 'skip'
+  pi-version:
+    description: 'Pinned @earendil-works/pi-coding-agent version.'
+    required: false
+    default: '1.0.0'
+  provider-extension-version:
+    description: 'Pinned @hank-warren/pi-cliproxyapi-provider version.'
+    required: false
+    default: '0.2.2'
+  upload-transcript:
+    description: 'Upload the JSONL session transcript as an artifact.'
+    required: false
+    default: 'true'
+
+outputs:
+  skipped:
+    description: '`true` when nothing ran (closed PR, or a bot-authored PR).'
+    value: ${{ steps.gate.outputs.run != 'true' }}
+  verdict:
+    description: '`approve` or `request-changes`, as judged by the agent.'
+    value: ${{ steps.apply.outputs.verdict }}
+  event:
+    description: 'Review event actually posted: APPROVE, REQUEST_CHANGES or COMMENT.'
+    value: ${{ steps.apply.outputs.event }}
+  review-url:
+    description: 'URL of the posted review.'
+    value: ${{ steps.apply.outputs.review-url }}
+  model-used:
+    description: 'The model that produced the review.'
+    value: ${{ steps.pi.outputs.model-used }}
+  rate-limited:
+    description: '`true` when gateway quota was exhausted.'
+    value: ${{ steps.pi.outputs.rate-limited }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check inputs
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        APP_ID: ${{ inputs.app-client-id }}
+        APP_KEY: ${{ inputs.app-private-key }}
+      run: |
+        set -euo pipefail
+        case "$MODE" in verdict|comment) ;; *) echo "::error title=pi-pr-review::mode must be verdict or comment, got '${MODE}'."; exit 1 ;; esac
+        if [ -n "$APP_ID" ] && [ -z "$APP_KEY" ]; then
+          echo "::error title=pi-pr-review::app-private-key is required with app-client-id."; exit 1
+        fi
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Mint App write token
+      id: app-token
+      if: ${{ inputs.app-client-id != '' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-contents: read
+        permission-pull-requests: write
+
+    - name: Mint App read-only token
+      id: read-token
+      if: ${{ inputs.app-client-id != '' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-contents: read
+        permission-issues: read
+        permission-pull-requests: read
+
+    - name: Fetch the pull request
+      id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_PR: ${{ inputs.pr-number }}
+      run: |
+        set -euo pipefail
+        [[ "$PI_PR" =~ ^[0-9]+$ ]] || { echo "::error title=pi-pr-review::pr-number must be a number, got '${PI_PR}'."; exit 1; }
+        work="${RUNNER_TEMP}/pi-pr-review"
+        rm -rf "$work" && mkdir -p "$work/in" "$work/out"
+        gh api "repos/${PI_REPO}/pulls/${PI_PR}" --jq '{number, title, body, state, draft,
+          author: .user.login, author_type: .user.type, base: .base.ref, head: .head.ref,
+          head_sha: .head.sha, additions, deletions, changed_files}' > "$work/in/pr.json"
+        IFS=$'\t' read -r state type login sha < <(jq -r '[.state, .author_type, .author, .head_sha] | @tsv' "$work/in/pr.json")
+        run=true
+        if [ "$state" != "open" ]; then
+          run=false; echo "::notice title=pi-pr-review::Skipping #${PI_PR}: it is ${state}."
+        elif [ "$type" != "User" ]; then
+          run=false; echo "::notice title=pi-pr-review::Skipping #${PI_PR}: opened by ${login} (${type}); Pi reviews human-authored PRs only."
+        fi
+        if [ "$run" = "true" ]; then
+          gh api --paginate "repos/${PI_REPO}/pulls/${PI_PR}/files?per_page=100" \
+            --jq '.[] | {filename, status, additions, deletions, previous_filename, patch}' \
+            | jq -s . > "$work/in/files.json"
+          # The diff endpoint refuses very large PRs; fall back to the per-file patches.
+          if ! gh api "repos/${PI_REPO}/pulls/${PI_PR}" -H 'Accept: application/vnd.github.diff' > "$work/in/diff.patch" 2>/dev/null; then
+            echo "::warning title=pi-pr-review::Full diff unavailable; using per-file patches (very large files may be missing)."
+            jq -r '.[] | "--- \(.previous_filename // .filename)\n+++ \(.filename)\n\(.patch // "(no textual patch: binary or too large)")\n"' \
+              "$work/in/files.json" > "$work/in/diff.patch"
+          fi
+          gh api --paginate "repos/${PI_REPO}/pulls/${PI_PR}/reviews?per_page=100" \
+            --jq '.[] | {author: .user.login, state, submitted_at, commit_id, body}' | jq -s . > "$work/in/reviews.json"
+          gh api --paginate "repos/${PI_REPO}/pulls/${PI_PR}/comments?per_page=100" \
+            --jq '.[] | {author: .user.login, path, line, body, created_at}' | jq -s . > "$work/in/review-comments.json"
+        fi
+        {
+          echo "run=${run}"
+          echo "head-sha=${sha}"
+          echo "in=${work}/in"
+          echo "out=${work}/out"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Install pi
+      if: ${{ steps.gate.outputs.run == 'true' }}
+      shell: bash
+      env:
+        PI_VERSION: ${{ inputs.pi-version }}
+        PROVIDER_EXTENSION_VERSION: ${{ inputs.provider-extension-version }}
+      run: bash "${{ github.action_path }}/../lib/install-pi.sh"
+
+    - name: Review with Pi
+      id: pi
+      if: ${{ steps.gate.outputs.run == 'true' }}
+      shell: bash
+      env:
+        PI_ACTION_PROMPT: >-
+          Review pull request #${{ inputs.pr-number }} in ${{ inputs.repository }} following the
+          pr-review skill. Write review.md and result.json to the directory in $PI_OUT.
+        PI_ACTION_PROMPT_FILE: ''
+        PI_ACTION_SKILL: ${{ github.action_path }}/skill
+        PI_ACTION_APPEND_SYSTEM_PROMPT: ''
+        PI_ACTION_MODEL: ${{ inputs.model }}
+        PI_ACTION_FALLBACK_MODELS: ${{ inputs.fallback-models }}
+        PI_ACTION_THINKING: ${{ inputs.thinking }}
+        PI_ACTION_TOOLS: ${{ inputs.tools }}
+        PI_ACTION_MAX_TURNS: ${{ inputs.max-turns }}
+        PI_ACTION_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        PI_ACTION_ON_RATE_LIMIT: ${{ inputs.on-rate-limit }}
+        PI_ACTION_CPA_API_KEY: ${{ inputs.cliproxyapi-api-key }}
+        PI_ACTION_CPA_BASE_URL: ${{ inputs.cliproxyapi-base-url }}
+        PI_ACTION_EXTENSION_DIR: ${{ runner.temp }}/pi-ext
+        # Read-only App token when there is an App; otherwise no GitHub credential at all.
+        PI_ACTION_GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_ACTION_BOT_LOGIN: ''
+        PI_ACTION_BOT_EMAIL: ''
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        PI_REPO: ${{ inputs.repository }}
+        PI_PR: ${{ inputs.pr-number }}
+        PI_IN: ${{ steps.gate.outputs.in }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_REVIEW_MODE: ${{ inputs.mode }}
+      run: node "${{ github.action_path }}/../runner.mjs"
+
+    - name: Post review
+      id: apply
+      if: ${{ steps.gate.outputs.run == 'true' && steps.pi.outcome == 'success' && steps.pi.outputs.rate-limited != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_PR: ${{ inputs.pr-number }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_HEAD_SHA: ${{ steps.gate.outputs.head-sha }}
+        PI_REVIEW_MODE: ${{ inputs.mode }}
+        PI_DRY_RUN: ${{ inputs.dry-run }}
+        PI_MODEL_USED: ${{ steps.pi.outputs.model-used }}
+      run: node "${{ github.action_path }}/apply.mjs"
+
+    - name: Upload transcript
+      if: ${{ always() && inputs.upload-transcript == 'true' && steps.pi.outputs.transcript != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: pi-review-${{ inputs.pr-number }}-${{ github.run_attempt }}
+        path: |
+          ${{ steps.pi.outputs.transcript }}
+          ${{ steps.gate.outputs.out }}
+        if-no-files-found: warn
+        retention-days: 30

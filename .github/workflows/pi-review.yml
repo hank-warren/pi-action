@@ -1,0 +1,34 @@
+name: Pi Code Review
+
+# Dogfoods ./pr-review on this repo's own PRs, so a PR that changes the action
+# reviews itself with its own code. Repo guidance: .github/pi/review.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pi-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pi-review:
+    # Same-repo, human-authored PRs only: forks get no secrets, and bots are skipped.
+    if: >-
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: ./pr-review
+        with:
+          cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+          cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}

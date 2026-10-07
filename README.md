@@ -32,6 +32,39 @@ jobs:
 Runs on `ubuntu-latest`; the gateway must be reachable from the runner. Comments and reviews post as
 your App's `<app-slug>[bot]`, or `github-actions[bot]` without one (see [Bot identity](#bot-identity)).
 
+## PR review
+
+`hank-warren/pi-action/pr-review@v1` posts one review per push: an approval for a clean PR, or
+"request changes" with `path:line` findings. Older Pi reviews on the PR are collapsed so only the
+newest stays expanded. See [`examples/workflows/pi-review.yml`](examples/workflows/pi-review.yml):
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    persist-credentials: false
+- uses: hank-warren/pi-action/pr-review@v1
+  with:
+    cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+    cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}
+```
+
+- **Models:** `cpa/gpt-6.1-sol`, falling back to `cpa/claude-opus-5-5` on quota exhaustion or an
+  unavailable model, with `thinking: high`. Out of quota on both posts nothing and exits 0.
+- **The agent never writes to GitHub.** The action prefetches the PR's metadata, diff and earlier
+  reviews into files; the agent reads those and the checkout and writes a verdict plus a review body.
+  A deterministic step posts exactly one review, pinned to the reviewed commit, and posts nothing if
+  the PR moved on meanwhile. The default tool set has no `bash`, so the model cannot run commands that
+  see the gateway key.
+- **Identity:** `github-token` (default `GITHUB_TOKEN`, `github-actions[bot]`) or an App via
+  `app-client-id` / `app-private-key`. `GITHUB_TOKEN` can only approve when the repo enables
+  *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*; without
+  it an approval is posted as a comment and this identity's earlier "changes requested" is dismissed
+  instead, so a fixed PR is never left blocked.
+- **`mode: comment`** posts the same review as a plain comment that never approves or blocks.
+- Repos can add `.github/pi/review.md` with what matters (and what to ignore) locally; the skill reads
+  it along with `AGENTS.md`/`CLAUDE.md`. `dry-run: true` writes the planned review to the step
+  summary instead.
+
 ## Issue triage and draft fixes
 
 Two packaged sub-actions ship their own skills, so every repo gets the same behavior from a short
