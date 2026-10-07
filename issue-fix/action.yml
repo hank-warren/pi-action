@@ -1,0 +1,305 @@
+name: 'Pi Issue Fix'
+description: 'On request, have Pi attempt a fix for a human-created issue and open it as a DRAFT pull request for a developer to finish.'
+author: 'hank-warren'
+
+branding:
+  icon: 'tool'
+  color: 'purple'
+
+# The agent edits the working tree with a read-only token and no push
+# credentials. A separate step checks the diff (size, forbidden paths), commits
+# as the bot, pushes `pi/issue-<n>`, and opens a draft PR. Nothing in this action
+# can open a non-draft PR or mark one ready. The trigger label is removed after
+# every attempt so it can be re-applied to retry.
+#
+# Run the caller's toolchain setup (dependencies, linters) BEFORE this action so
+# the agent can run tests. The working tree must be clean when it starts.
+
+inputs:
+  cliproxyapi-api-key:
+    description: 'CLIProxyAPI client key. Required.'
+    required: true
+  cliproxyapi-base-url:
+    description: 'CLIProxyAPI OpenAI-compatible base URL, including /v1, e.g. https://cpa.example.com/v1. Must be reachable from the runner.'
+    required: true
+  app-client-id:
+    description: 'GitHub App Client ID. The App needs contents, pull-requests and issues write.'
+    required: true
+  app-private-key:
+    description: 'GitHub App private key.'
+    required: true
+  issue-number:
+    description: 'Issue to fix.'
+    required: false
+    default: ${{ github.event.issue.number }}
+  repository:
+    description: 'owner/name of the issue''s repository. The checkout in the working directory must be this repository.'
+    required: false
+    default: ${{ github.repository }}
+  base-branch:
+    description: 'Branch the fix is based on and the draft PR targets.'
+    required: false
+    default: ${{ github.event.repository.default_branch }}
+  requested-by:
+    description: 'Login of the human who asked for the fix; assigned to the draft PR.'
+    required: false
+    default: ${{ github.event.sender.login }}
+  requested-by-type:
+    description: 'Account type of the requester. Anything but `User` is refused.'
+    required: false
+    default: ${{ github.event.sender.type }}
+  trigger-label:
+    description: 'Label that requested the fix; removed after every attempt.'
+    required: false
+    default: 'pi:fix'
+  pr-label:
+    description: 'Label added to the draft PR when it exists in the repo.'
+    required: false
+    default: 'pi-draft'
+  max-changed-files:
+    description: 'Refuse to open a PR touching more files than this.'
+    required: false
+    default: '20'
+  max-changed-lines:
+    description: 'Refuse to open a PR changing more lines (added + deleted) than this.'
+    required: false
+    default: '600'
+  forbidden-paths:
+    description: 'Path prefixes Pi may not change, one per line.'
+    required: false
+    default: |
+      .github/
+  dry-run:
+    description: 'Run the agent but push and post nothing; the diff and PR body go to the step summary.'
+    required: false
+    default: 'false'
+  model:
+    description: 'Gateway model.'
+    required: false
+    default: 'cpa/claude-opus-5-5'
+  fallback-models:
+    description: 'Ordered fallback gateway models.'
+    required: false
+    default: 'cpa/gpt-6.1-sol'
+  thinking:
+    description: 'Thinking level.'
+    required: false
+    default: 'high'
+  max-turns:
+    description: 'Assistant turn cap.'
+    required: false
+    default: '100'
+  timeout-minutes:
+    description: 'Wall-clock limit for the agent.'
+    required: false
+    default: '45'
+  on-rate-limit:
+    description: '`skip` (default) tells the requester quota is exhausted and exits 0; `fail` fails the step.'
+    required: false
+    default: 'skip'
+  pi-version:
+    description: 'Pinned @earendil-works/pi-coding-agent version.'
+    required: false
+    default: '1.0.0'
+  provider-extension-version:
+    description: 'Pinned @hank-warren/pi-cliproxyapi-provider version.'
+    required: false
+    default: '0.2.2'
+  upload-transcript:
+    description: 'Upload the JSONL session transcript as an artifact.'
+    required: false
+    default: 'true'
+
+outputs:
+  skipped:
+    description: '`true` when nothing ran (a pull request, a bot-created issue, or a bot requester).'
+    value: ${{ steps.gate.outputs.run != 'true' }}
+  pr-number:
+    description: 'Number of the draft PR, when one was opened.'
+    value: ${{ steps.apply.outputs.pr-number }}
+  pr-url:
+    description: 'URL of the draft PR, when one was opened.'
+    value: ${{ steps.apply.outputs.pr-url }}
+  model-used:
+    description: 'The model that produced the fix.'
+    value: ${{ steps.pi.outputs.model-used }}
+  rate-limited:
+    description: '`true` when gateway quota was exhausted.'
+    value: ${{ steps.pi.outputs.rate-limited }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Mint read-only token
+      id: read-token
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-contents: read
+        permission-issues: read
+        permission-pull-requests: read
+
+    # run=false: silently not ours (PR, bot issue, bot requester).
+    # blocked=<reason>: a human asked, but we will not start; apply explains why.
+    - name: Check the request
+      id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_BASE: ${{ inputs.base-branch }}
+        REQUESTER_TYPE: ${{ inputs.requested-by-type }}
+      run: |
+        set -euo pipefail
+        [[ "$PI_ISSUE" =~ ^[0-9]+$ ]] || { echo "::error title=pi-issue-fix::issue-number must be a number, got '${PI_ISSUE}'."; exit 1; }
+        [ -n "$PI_BASE" ] || { echo "::error title=pi-issue-fix::base-branch is empty."; exit 1; }
+        IFS=$'\t' read -r type login is_pr state < <(gh api "repos/${PI_REPO}/issues/${PI_ISSUE}" --jq '[.user.type, .user.login, (.pull_request != null), .state] | @tsv')
+        run=true
+        blocked=""
+        branch="pi/issue-${PI_ISSUE}"
+        if [ "$is_pr" = "true" ]; then
+          run=false; echo "::notice title=pi-issue-fix::Skipping #${PI_ISSUE}: it is a pull request."
+        elif [ "$type" != "User" ]; then
+          run=false; echo "::notice title=pi-issue-fix::Skipping #${PI_ISSUE}: opened by ${login} (${type}); Pi works on human-created issues only."
+        elif [ "$REQUESTER_TYPE" != "User" ]; then
+          run=false; echo "::notice title=pi-issue-fix::Skipping #${PI_ISSUE}: requested by a ${REQUESTER_TYPE:-unknown} account."
+        elif [ "$state" != "open" ]; then
+          blocked="the issue is closed"
+        else
+          open="$(gh pr list -R "$PI_REPO" --head "$branch" --state open --json url --jq '.[0].url // ""')"
+          [ -z "$open" ] || blocked="a Pi draft for this issue is already open (${open}); close it first to start over"
+        fi
+        [ -z "$blocked" ] || echo "::notice title=pi-issue-fix::Not starting: ${blocked}."
+        work="${RUNNER_TEMP}/pi-issue-fix"
+        rm -rf "$work" && mkdir -p "$work/out"
+        {
+          echo "run=${run}"
+          echo "blocked=${blocked}"
+          echo "branch=${branch}"
+          echo "owner=${PI_REPO%%/*}"
+          echo "name=${PI_REPO#*/}"
+          echo "out=${work}/out"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Create the fix branch
+      id: branch
+      if: ${{ steps.gate.outputs.run == 'true' && steps.gate.outputs.blocked == '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_BASE: ${{ inputs.base-branch }}
+        PI_BRANCH: ${{ steps.gate.outputs.branch }}
+      run: |
+        set -euo pipefail
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::error title=pi-issue-fix::The working tree is dirty before the agent started; gitignore setup output so only Pi's changes reach the PR."
+          git status --short | head -20
+          exit 1
+        fi
+        auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+        echo "::add-mask::${auth#AUTHORIZATION: basic }"
+        git -c http.https://github.com/.extraheader= -c "http.https://github.com/.extraheader=${auth}" \
+          fetch --no-tags --depth=50 origin "+refs/heads/${PI_BASE}:refs/remotes/origin/${PI_BASE}"
+        git switch -q -C "$PI_BRANCH" "origin/${PI_BASE}"
+        echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Install pi
+      if: ${{ steps.branch.outcome == 'success' }}
+      shell: bash
+      env:
+        PI_VERSION: ${{ inputs.pi-version }}
+        PROVIDER_EXTENSION_VERSION: ${{ inputs.provider-extension-version }}
+      run: bash "${{ github.action_path }}/../lib/install-pi.sh"
+
+    - name: Fix with Pi
+      id: pi
+      if: ${{ steps.branch.outcome == 'success' }}
+      shell: bash
+      env:
+        PI_ACTION_PROMPT: >-
+          Attempt a fix for issue #${{ inputs.issue-number }} in ${{ inputs.repository }} following
+          the issue-fix skill. Leave changes uncommitted and write your outputs to the directory in $PI_OUT.
+        PI_ACTION_PROMPT_FILE: ''
+        PI_ACTION_SKILL: ${{ github.action_path }}/skill
+        PI_ACTION_APPEND_SYSTEM_PROMPT: ''
+        PI_ACTION_MODEL: ${{ inputs.model }}
+        PI_ACTION_FALLBACK_MODELS: ${{ inputs.fallback-models }}
+        PI_ACTION_THINKING: ${{ inputs.thinking }}
+        PI_ACTION_TOOLS: read,bash,edit,write,grep,find,ls
+        PI_ACTION_MAX_TURNS: ${{ inputs.max-turns }}
+        PI_ACTION_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        PI_ACTION_ON_RATE_LIMIT: ${{ inputs.on-rate-limit }}
+        PI_ACTION_CPA_API_KEY: ${{ inputs.cliproxyapi-api-key }}
+        PI_ACTION_CPA_BASE_URL: ${{ inputs.cliproxyapi-base-url }}
+        PI_ACTION_EXTENSION_DIR: ${{ runner.temp }}/pi-ext
+        PI_ACTION_GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_ACTION_BOT_LOGIN: ''
+        PI_ACTION_BOT_EMAIL: ''
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_BASE: ${{ inputs.base-branch }}
+        PI_BRANCH: ${{ steps.gate.outputs.branch }}
+        PI_REQUESTER: ${{ inputs.requested-by }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_MAX_FILES: ${{ inputs.max-changed-files }}
+        PI_MAX_LINES: ${{ inputs.max-changed-lines }}
+        PI_FORBIDDEN: ${{ inputs.forbidden-paths }}
+      run: node "${{ github.action_path }}/../runner.mjs"
+
+    - name: Mint write token
+      id: write-token
+      if: ${{ always() && steps.gate.outputs.run == 'true' && inputs.dry-run != 'true' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ steps.gate.outputs.owner }}
+        repositories: ${{ steps.gate.outputs.name }}
+        permission-contents: write
+        permission-pull-requests: write
+        permission-issues: write
+
+    - name: Open draft PR or report
+      id: apply
+      if: ${{ always() && steps.gate.outputs.run == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.write-token.outputs.token || steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug }}[bot]
+        PI_DRY_RUN: ${{ inputs.dry-run }}
+        PI_BASE: ${{ inputs.base-branch }}
+        PI_BASE_SHA: ${{ steps.branch.outputs.sha }}
+        PI_BRANCH: ${{ steps.gate.outputs.branch }}
+        PI_REQUESTER: ${{ inputs.requested-by }}
+        PI_TRIGGER_LABEL: ${{ inputs.trigger-label }}
+        PI_PR_LABEL: ${{ inputs.pr-label }}
+        PI_BLOCKED: ${{ steps.gate.outputs.blocked || (steps.branch.outcome == 'failure' && 'the checkout could not be prepared; see the run') || '' }}
+        PI_AGENT_OUTCOME: ${{ steps.pi.outcome }}
+        PI_RATE_LIMITED: ${{ steps.pi.outputs.rate-limited }}
+        PI_MODEL_USED: ${{ steps.pi.outputs.model-used }}
+        PI_MAX_FILES: ${{ inputs.max-changed-files }}
+        PI_MAX_LINES: ${{ inputs.max-changed-lines }}
+        PI_FORBIDDEN: ${{ inputs.forbidden-paths }}
+      run: node "${{ github.action_path }}/apply.mjs"
+
+    - name: Upload transcript
+      if: ${{ always() && inputs.upload-transcript == 'true' && steps.pi.outputs.transcript != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: pi-fix-${{ inputs.issue-number }}-${{ github.run_attempt }}
+        path: |
+          ${{ steps.pi.outputs.transcript }}
+          ${{ steps.gate.outputs.out }}
+        if-no-files-found: warn
+        retention-days: 30

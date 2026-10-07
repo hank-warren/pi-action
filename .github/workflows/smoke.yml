@@ -1,0 +1,61 @@
+name: Smoke test
+
+# Manual only: this spends real gateway quota.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Gateway model to pin'
+        default: 'cpa/claude-sonnet-5-5'
+      fallback-models:
+        description: 'Fallback models (e.g. a disabled primary plus cpa/gpt-6.1-sol exercises fallback)'
+        default: ''
+      use-app:
+        description: 'Mint the pi GitHub App token and assert the bot identity'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run agent with a mechanically verifiable task
+        id: agent
+        uses: ./
+        with:
+          model: ${{ inputs.model }}
+          fallback-models: ${{ inputs.fallback-models }}
+          tools: read
+          max-turns: '5'
+          timeout-minutes: '5'
+          prompt: |
+            Read README.md in the current directory and reply with exactly one line:
+            the value of the `pi-version` default listed in the Inputs table,
+            with no other text, no punctuation, and no code fences.
+          cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+          cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}
+          app-client-id: ${{ inputs.use-app && vars.PI_APP_CLIENT_ID || '' }}
+          app-private-key: ${{ inputs.use-app && secrets.PI_APP_PRIVATE_KEY || '' }}
+
+      - name: Verify the agent actually read the repo
+        env:
+          RESULT: ${{ steps.agent.outputs.result }}
+          TURNS: ${{ steps.agent.outputs.turns }}
+          MODEL_USED: ${{ steps.agent.outputs.model-used }}
+          IDENTITY: ${{ steps.agent.outputs.bot-identity }}
+          USE_APP: ${{ inputs.use-app }}
+        run: |
+          set -euo pipefail
+          expected="$(grep -oP '`pi-version` \| `\K[^`]+' README.md)"
+          actual="$(printf '%s' "$RESULT" | tr -d '[:space:]')"
+          echo "expected=${expected} actual=${actual} turns=${TURNS} model-used=${MODEL_USED} identity=${IDENTITY}"
+          [ "$actual" = "$expected" ] || { echo "::error::agent output did not match README"; exit 1; }
+          if [ "$USE_APP" = "true" ]; then
+            [[ "$IDENTITY" == *"[bot]" ]] || { echo "::error::expected an App bot identity, got ${IDENTITY}"; exit 1; }
+          fi
+          echo "smoke test passed"

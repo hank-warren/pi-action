@@ -1,0 +1,236 @@
+name: 'Pi Agent'
+description: 'Run the Pi coding agent headlessly in CI through CLIProxyAPI. Generic, skill-driven replacement for claude-code-action.'
+author: 'hank-warren'
+
+branding:
+  icon: 'cpu'
+  color: 'purple'
+
+inputs:
+  # ---- What the agent should do -------------------------------------------
+  prompt:
+    description: 'Instruction text for the agent. Mutually exclusive with prompt-file.'
+    required: false
+    default: ''
+  prompt-file:
+    description: 'Path to a file containing the prompt. Mutually exclusive with prompt.'
+    required: false
+    default: ''
+  skill:
+    description: >-
+      Skill file or directory to load, one path per line. Loaded explicitly;
+      ambient skill discovery is disabled so only these are in scope.
+    required: false
+    default: ''
+  append-system-prompt:
+    description: 'Text (or a file path) appended to the system prompt.'
+    required: false
+    default: ''
+
+  # ---- Model and limits ----------------------------------------------------
+  model:
+    description: 'cpa/<model-id> as listed by the gateway''s /v1/models, e.g. cpa/claude-opus-5-5.'
+    required: false
+    default: 'cpa/claude-opus-5-5'
+  fallback-models:
+    description: >-
+      Ordered gateway models to fall back to, comma- or newline-separated, e.g.
+      cpa/gpt-6.1-sol. A model the gateway does not list is skipped up front; a run
+      that ends on quota exhaustion or an unavailable model (disabled, no usable
+      credential) is re-run from scratch on the next one. timeout-minutes covers all
+      attempts.
+    required: false
+    default: ''
+  thinking:
+    description: 'Thinking level: off, minimal, low, medium, high, xhigh, max. Empty uses the model default.'
+    required: false
+    default: ''
+  tools:
+    description: >-
+      Comma-separated allowlist of tool names (read, bash, edit, write, ...).
+      Empty means pi''s default toolset. Prefer an explicit allowlist in CI.
+    required: false
+    default: ''
+  max-turns:
+    description: 'Maximum assistant turns. The step FAILS if the agent exceeds it.'
+    required: false
+    default: '25'
+  timeout-minutes:
+    description: 'Hard wall-clock limit for the agent run.'
+    required: false
+    default: '20'
+  on-rate-limit:
+    description: >-
+      What to do when every gateway credential for the model (and for every
+      fallback model) is in quota cooldown.
+      `fail` (default) fails the step. `skip` exits 0, emits a warning, and sets the
+      `rate-limited` output so callers can branch. Being out of quota is not the same
+      failure as a broken action.
+    required: false
+    default: 'fail'
+
+  # ---- Gateway (CLIProxyAPI) -----------------------------------------------
+  cliproxyapi-api-key:
+    description: 'CLIProxyAPI client key. Required. One key per consumer, so gateway usage is attributable.'
+    required: true
+  cliproxyapi-base-url:
+    description: 'CLIProxyAPI OpenAI-compatible base URL, including /v1, e.g. https://cpa.example.com/v1. Must be reachable from the runner.'
+    required: true
+
+  # ---- Bot identity --------------------------------------------------------
+  app-client-id:
+    description: >-
+      GitHub App Client ID for the bot identity the agent posts as. When set, the action mints an
+      installation token and exposes it to the agent as GH_TOKEN, so comments and reviews are
+      attributed to <app-slug>[bot] instead of github-actions[bot]. Optional.
+    required: false
+    default: ''
+  app-private-key:
+    description: 'GitHub App private key. Required when app-client-id is set.'
+    required: false
+    default: ''
+  app-permission-contents:
+    description: >-
+      Contents permission for the minted App token (read, write, or empty to omit). The token is
+      scoped down to these three permissions; the App's own grant is the ceiling.
+    required: false
+    default: 'read'
+  app-permission-issues:
+    description: 'Issues permission for the minted App token (read, write, or empty to omit).'
+    required: false
+    default: 'read'
+  app-permission-pull-requests:
+    description: 'Pull requests permission for the minted App token (read, write, or empty to omit).'
+    required: false
+    default: 'write'
+  github-token:
+    description: >-
+      Explicit GitHub token for the agent (GH_TOKEN), e.g. secrets.GITHUB_TOKEN or a PAT.
+      Mutually exclusive with app-client-id. With neither, the caller's GH_TOKEN env passes through.
+    required: false
+    default: ''
+
+  # ---- Execution -----------------------------------------------------------
+  working-directory:
+    description: 'Directory the agent runs in.'
+    required: false
+    default: '.'
+  pi-version:
+    description: 'Pinned @earendil-works/pi-coding-agent version.'
+    required: false
+    default: '1.0.0'
+  provider-extension-version:
+    description: 'Pinned @hank-warren/pi-cliproxyapi-provider version.'
+    required: false
+    default: '0.2.2'
+  upload-transcript:
+    description: 'Upload the full JSONL session transcript as a workflow artifact.'
+    required: false
+    default: 'true'
+  transcript-name:
+    description: 'Artifact name for the transcript.'
+    required: false
+    default: 'pi-session'
+
+outputs:
+  bot-identity:
+    description: 'The login the agent posted as: <app-slug>[bot], or `github-actions` when no App is configured.'
+    value: ${{ steps.bot.outputs.login || 'github-actions' }}
+  model-used:
+    description: 'The model that produced the final result (or the last one tried).'
+    value: ${{ steps.pi.outputs.model-used }}
+  result:
+    description: 'Final assistant message text.'
+    value: ${{ steps.pi.outputs.result }}
+  turns:
+    description: 'Number of assistant turns used.'
+    value: ${{ steps.pi.outputs.turns }}
+  transcript:
+    description: 'Path to the raw JSONL transcript on the runner.'
+    value: ${{ steps.pi.outputs.transcript }}
+  rate-limited:
+    description: '`true` when the run stopped because every gateway credential for the model was in quota cooldown.'
+    value: ${{ steps.pi.outputs.rate-limited }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check identity inputs
+      if: ${{ inputs.app-client-id != '' && inputs.github-token != '' }}
+      shell: bash
+      run: |
+        echo "::error title=pi-action::Provide either app-client-id or github-token, not both."
+        exit 1
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Mint GitHub App token
+      id: app-token
+      if: ${{ inputs.app-client-id != '' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-contents: ${{ inputs.app-permission-contents }}
+        permission-issues: ${{ inputs.app-permission-issues }}
+        permission-pull-requests: ${{ inputs.app-permission-pull-requests }}
+
+    # Git attribution for any commits the agent makes, like claude-code-action's
+    # bot_id/bot_name: <id>+<slug>[bot]@users.noreply.github.com links to the App.
+    - name: Resolve bot user
+      id: bot
+      if: ${{ inputs.app-client-id != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+      run: |
+        set -euo pipefail
+        login="${APP_SLUG}[bot]"
+        id="$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq .id)"
+        echo "login=${login}" >> "$GITHUB_OUTPUT"
+        echo "email=${id}+${login}@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+    - name: Install pi and the CLIProxyAPI provider
+      shell: bash
+      env:
+        PI_VERSION: ${{ inputs.pi-version }}
+        PROVIDER_EXTENSION_VERSION: ${{ inputs.provider-extension-version }}
+      run: bash "${{ github.action_path }}/lib/install-pi.sh"
+
+    - name: Run Pi
+      id: pi
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PI_ACTION_PROMPT: ${{ inputs.prompt }}
+        PI_ACTION_PROMPT_FILE: ${{ inputs.prompt-file }}
+        PI_ACTION_SKILL: ${{ inputs.skill }}
+        PI_ACTION_APPEND_SYSTEM_PROMPT: ${{ inputs.append-system-prompt }}
+        PI_ACTION_MODEL: ${{ inputs.model }}
+        PI_ACTION_FALLBACK_MODELS: ${{ inputs.fallback-models }}
+        PI_ACTION_THINKING: ${{ inputs.thinking }}
+        PI_ACTION_TOOLS: ${{ inputs.tools }}
+        PI_ACTION_MAX_TURNS: ${{ inputs.max-turns }}
+        PI_ACTION_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        PI_ACTION_ON_RATE_LIMIT: ${{ inputs.on-rate-limit }}
+        PI_ACTION_CPA_API_KEY: ${{ inputs.cliproxyapi-api-key }}
+        PI_ACTION_CPA_BASE_URL: ${{ inputs.cliproxyapi-base-url }}
+        PI_ACTION_EXTENSION_DIR: ${{ runner.temp }}/pi-ext
+        PI_ACTION_GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github-token }}
+        PI_ACTION_BOT_LOGIN: ${{ steps.bot.outputs.login }}
+        PI_ACTION_BOT_EMAIL: ${{ steps.bot.outputs.email }}
+      run: node "${{ github.action_path }}/runner.mjs"
+
+    - name: Upload transcript
+      if: ${{ always() && inputs.upload-transcript == 'true' && steps.pi.outputs.transcript != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.transcript-name }}
+        path: ${{ steps.pi.outputs.transcript }}
+        if-no-files-found: warn
+        retention-days: 30

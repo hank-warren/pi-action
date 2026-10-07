@@ -1,0 +1,36 @@
+# Template GitHub App settings for a Pi bot identity. See docs/BOT-IDENTITY.md.
+#
+# GitHub Apps are created through the browser, so this is not applied automatically:
+# transcribe it when creating the App, and keep your own copy in sync if the App changes.
+#
+# App names are global across GitHub; `pi-action` and `pi` are both taken, so
+# prefix yours (e.g. `acme-pi`, which posts as `acme-pi[bot]`).
+
+name: acme-pi
+description: >-
+  Posts pull request comments and reviews on behalf of Pi agent workflows,
+  so agent output is attributed to its own bot rather than github-actions[bot].
+url: https://github.com/hank-warren/pi-action
+
+# This App only acts through short-lived installation tokens minted in CI.
+# It receives no events and needs no webhook endpoint.
+hook_attributes:
+  active: false
+
+public: false
+
+# A ceiling: every job mints a token scoped down to what it needs (see
+# docs/BOT-IDENTITY.md). Never add `workflows`: without it GitHub rejects any
+# push touching .github/workflows/.
+default_permissions:
+  # Post PR reviews; open draft PRs (issue-fix apply step only).
+  pull_requests: write
+  # Read code under review; push pi/issue-* branches (issue-fix apply step only).
+  contents: write
+  # Read linked issues; label and comment on issues, file follow-ups (apply steps only).
+  issues: write
+  # Mandatory for all Apps.
+  metadata: read
+
+# No events: nothing subscribes to this App.
+default_events: []

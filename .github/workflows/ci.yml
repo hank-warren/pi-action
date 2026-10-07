@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Syntax check scripts
+        run: |
+          set -euo pipefail
+          for file in runner.mjs lib/*.mjs issue-*/apply.mjs; do node --check "$file"; done
+
+      - name: Unit tests
+        run: node --test
+
+      - name: Validate action.yml files
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const runner = fs.readFileSync("runner.mjs", "utf8");
+            const used = [...new Set([...runner.matchAll(/input\("(PI_ACTION_[A-Z_]+)"\)/g)].map((m) => m[1]))];
+            const versionOf = (src, input) => (src.match(new RegExp(input + ":[\\s\\S]*?default: .([0-9.]+).")) || [])[1];
+            const root = fs.readFileSync("action.yml", "utf8");
+            for (const file of ["action.yml", "issue-triage/action.yml", "issue-fix/action.yml"]) {
+              const src = fs.readFileSync(file, "utf8");
+              for (const key of ["name:", "description:", "runs:", "using: composite"]) {
+                if (!src.includes(key)) throw new Error(file + " missing " + key);
+              }
+              // every input the runner reads must be passed by every action that runs it
+              const missing = used.filter((v) => !src.includes(v + ":"));
+              if (missing.length) throw new Error(file + " does not pass: " + missing.join(", "));
+              // sub-actions pin the same pi and provider versions as the root action
+              for (const input of ["pi-version", "provider-extension-version"]) {
+                if (versionOf(src, input) !== versionOf(root, input)) {
+                  throw new Error(file + " " + input + " " + versionOf(src, input) + " != root " + versionOf(root, input));
+                }
+              }
+              console.log(file + " ok, " + used.length + " runner inputs wired");
+            }
+          '
+
+      - name: Guard gateway-only model access
+        run: |
+          set -euo pipefail
+          # Ambient provider credentials must be cleared so nothing bypasses the gateway.
+          for name in ANTHROPIC_AUTH_TOKEN ANTHROPIC_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY; do
+            grep -q "\"${name}\"" runner.mjs \
+              || { echo "::error::runner.mjs must clear ${name}"; exit 1; }
+          done
+          if grep -qE 'childEnv\.(ANTHROPIC|OPENAI)_[A-Z_]+ *=' runner.mjs; then
+            echo "::error::runner.mjs must never set provider credentials; model traffic goes through CLIProxyAPI"
+            exit 1
+          fi
+          echo "gateway env handling ok"
+
+      # runner.mjs seeds the provider's model snapshot at the path the extension
+      # reads. If a version bump moves that path, a cold run silently degrades to a
+      # placeholder model over openai-completions. Fail the bump instead.
+      - name: Check snapshot contract against the pinned provider extension
+        run: |
+          set -euo pipefail
+          version="$(node -e 'const y=require("fs").readFileSync("action.yml","utf8");console.log(y.match(/provider-extension-version:[\s\S]*?default: .([0-9.]+)./)[1])')"
+          npm install --prefix "$RUNNER_TEMP/ext" --no-fund --no-audit --no-save "@hank-warren/pi-cliproxyapi-provider@${version}"
+          src="$RUNNER_TEMP/ext/node_modules/@hank-warren/pi-cliproxyapi-provider"
+          test -f "$src/index.ts" || { echo "::error::extension entry index.ts missing in ${version}"; exit 1; }
+          # shellcheck disable=SC2016 # fixed-string matches on TypeScript source
+          if ! { grep -qF 'join(homedir(), ".cache", "pi-cliproxyapi-provider")' "$src/src/config.ts" \
+            && grep -qF 'Buffer.from(`${config.providerName}\n${config.baseUrl}`).toString("base64url")' "$src/src/config.ts" \
+            && grep -qF '"cpa-models.json"' "$src/src/discovery.ts" \
+            && grep -qF 'JSON.stringify({ fetchedAt, data }' "$src/src/cache.ts"; }; then
+            echo "::error::pi-cliproxyapi-provider ${version} changed its CPA snapshot layout; update the seed in runner.mjs"
+            exit 1
+          fi
+          echo "snapshot contract ok for pi-cliproxyapi-provider ${version}"

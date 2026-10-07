@@ -1,0 +1,78 @@
+name: Pi Issues
+
+# Triage every human-created issue; attempt a draft fix when a maintainer adds
+# `pi:fix`. Pi never opens a non-draft PR. Bot-created issues are skipped by the
+# actions themselves; the `if:` filters below just avoid starting a runner.
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue to re-triage'
+        required: true
+        type: number
+      dry_run:
+        description: 'Post nothing; write the planned triage to the run summary'
+        type: boolean
+        default: false
+
+jobs:
+  triage:
+    if: >-
+      (github.event_name == 'issues' && github.event.action == 'opened' &&
+        github.event.issue.user.type == 'User') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    concurrency:
+      group: pi-triage-${{ github.event.issue.number || inputs.issue_number }}
+      cancel-in-progress: true
+    # All GitHub writes use the Pi App token, not GITHUB_TOKEN.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: hank-warren/pi-action/issue-triage@v1
+        with:
+          issue-number: ${{ github.event.issue.number || inputs.issue_number }}
+          dry-run: ${{ inputs.dry_run || false }}
+          cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+          cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}
+          app-client-id: ${{ vars.PI_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.PI_APP_PRIVATE_KEY }}
+          # Optional: prefetch Sentry issues linked from the body.
+          sentry-base-url: https://sentry.example.com
+          sentry-auth-token: ${{ secrets.SENTRY_AUTH_TOKEN }}
+
+  fix:
+    if: >-
+      github.event_name == 'issues' && github.event.action == 'labeled' &&
+      github.event.label.name == 'pi:fix' && github.event.sender.type == 'User' &&
+      github.event.issue.user.type == 'User'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: pi-fix-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      # Repo-specific: install what the agent needs to run the relevant tests,
+      # e.g. `uv sync` or `npm ci`. Setup output must be gitignored.
+
+      - uses: hank-warren/pi-action/issue-fix@v1
+        with:
+          cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+          cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}
+          app-client-id: ${{ vars.PI_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.PI_APP_PRIVATE_KEY }}

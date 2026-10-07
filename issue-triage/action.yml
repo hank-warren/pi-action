@@ -1,0 +1,310 @@
+name: 'Pi Issue Triage'
+description: 'Triage a human-created issue with Pi: investigate read-only, then apply existing labels and one triage comment.'
+author: 'hank-warren'
+
+branding:
+  icon: 'search'
+  color: 'purple'
+
+# The agent gets a read-only token. A separate step applies its result with an
+# issues:write token: existing labels only, at most `max-new-issues` follow-ups,
+# one comment edited in place, never a close. Issues opened by bots (Sentry,
+# Dependabot, Pi itself) are skipped.
+
+inputs:
+  cliproxyapi-api-key:
+    description: 'CLIProxyAPI client key. Required.'
+    required: true
+  cliproxyapi-base-url:
+    description: 'CLIProxyAPI OpenAI-compatible base URL, including /v1, e.g. https://cpa.example.com/v1. Must be reachable from the runner.'
+    required: true
+  app-client-id:
+    description: 'GitHub App Client ID. Required: the App needs issues:write to post.'
+    required: true
+  app-private-key:
+    description: 'GitHub App private key.'
+    required: true
+  issue-number:
+    description: 'Issue to triage.'
+    required: false
+    default: ${{ github.event.issue.number }}
+  repository:
+    description: 'owner/name of the issue''s repository. The checkout in the working directory must be this repository.'
+    required: false
+    default: ${{ github.repository }}
+  dry-run:
+    description: 'Run the agent but write nothing to GitHub; the planned labels, issues and comment go to the step summary.'
+    required: false
+    default: 'false'
+  max-new-issues:
+    description: 'Most follow-up issues Pi may file per triage. 0 disables filing.'
+    required: false
+    default: '1'
+  release-branches:
+    description: 'How many of the most recently committed release/* branches to fetch so Pi can say which shipped lines are affected. 0 skips.'
+    required: false
+    default: '2'
+  fix-label:
+    description: 'Label that requests a Pi fix (see issue-fix). The triage comment suggests it for good candidates when it exists.'
+    required: false
+    default: 'pi:fix'
+  remove-labels:
+    description: 'Labels to remove once triaged, comma- or space-separated.'
+    required: false
+    default: 'needs-triage status:needs-triage'
+  sentry-base-url:
+    description: 'Sentry base URL, e.g. https://sentry.example.com. With sentry-auth-token, a Sentry issue linked in the body is prefetched for the agent.'
+    required: false
+    default: ''
+  sentry-org:
+    description: 'Sentry organization slug.'
+    required: false
+    default: 'sentry'
+  sentry-auth-token:
+    description: 'Sentry API token. Never exposed to the agent.'
+    required: false
+    default: ''
+  model:
+    description: 'Gateway model.'
+    required: false
+    default: 'cpa/claude-opus-5-5'
+  fallback-models:
+    description: 'Ordered fallback gateway models.'
+    required: false
+    default: 'cpa/gpt-6.1-sol'
+  thinking:
+    description: 'Thinking level.'
+    required: false
+    default: 'high'
+  max-turns:
+    description: 'Assistant turn cap.'
+    required: false
+    default: '60'
+  timeout-minutes:
+    description: 'Wall-clock limit for the agent.'
+    required: false
+    default: '30'
+  on-rate-limit:
+    description: '`skip` (default) posts nothing and exits 0 when gateway quota is exhausted; `fail` fails the step.'
+    required: false
+    default: 'skip'
+  pi-version:
+    description: 'Pinned @earendil-works/pi-coding-agent version.'
+    required: false
+    default: '1.0.0'
+  provider-extension-version:
+    description: 'Pinned @hank-warren/pi-cliproxyapi-provider version.'
+    required: false
+    default: '0.2.2'
+  upload-transcript:
+    description: 'Upload the JSONL session transcript as an artifact.'
+    required: false
+    default: 'true'
+
+outputs:
+  skipped:
+    description: '`true` when the issue was not triaged (a pull request, or opened by a bot).'
+    value: ${{ steps.gate.outputs.run != 'true' }}
+  comment-url:
+    description: 'URL of the triage comment.'
+    value: ${{ steps.apply.outputs.comment-url }}
+  fix-candidate:
+    description: '`yes`, `no`, or `unsure`.'
+    value: ${{ steps.apply.outputs.fix-candidate }}
+  created-issues:
+    description: 'Comma-separated numbers of follow-up issues Pi filed.'
+    value: ${{ steps.apply.outputs.created-issues }}
+  model-used:
+    description: 'The model that produced the triage.'
+    value: ${{ steps.pi.outputs.model-used }}
+  rate-limited:
+    description: '`true` when gateway quota was exhausted.'
+    value: ${{ steps.pi.outputs.rate-limited }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    # Org-wide read access, so the agent can search sibling repos too.
+    - name: Mint read-only token
+      id: read-token
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        permission-contents: read
+        permission-issues: read
+        permission-pull-requests: read
+
+    - name: Check the issue
+      id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+      run: |
+        set -euo pipefail
+        [[ "$PI_ISSUE" =~ ^[0-9]+$ ]] || { echo "::error title=pi-issue-triage::issue-number must be a number, got '${PI_ISSUE}'."; exit 1; }
+        IFS=$'\t' read -r type login is_pr < <(gh api "repos/${PI_REPO}/issues/${PI_ISSUE}" --jq '[.user.type, .user.login, (.pull_request != null)] | @tsv')
+        run=true
+        if [ "$is_pr" = "true" ]; then
+          run=false; echo "::notice title=pi-issue-triage::Skipping #${PI_ISSUE}: it is a pull request."
+        elif [ "$type" != "User" ]; then
+          run=false; echo "::notice title=pi-issue-triage::Skipping #${PI_ISSUE}: opened by ${login} (${type}); Pi triages human-created issues only."
+        fi
+        work="${RUNNER_TEMP}/pi-issue-triage"
+        rm -rf "$work" && mkdir -p "$work/in" "$work/out"
+        {
+          echo "run=${run}"
+          echo "owner=${PI_REPO%%/*}"
+          echo "name=${PI_REPO#*/}"
+          echo "in=${work}/in"
+          echo "out=${work}/out"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Fetch release lines
+      id: refs
+      if: ${{ steps.gate.outputs.run == 'true' && inputs.release-branches != '0' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        COUNT: ${{ inputs.release-branches }}
+      run: |
+        set -euo pipefail
+        # By last commit, not by name: repos mix naming schemes (release/v1.32.10, release/1.33).
+        # shellcheck disable=SC2016 # GraphQL variables, not shell
+        query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
+          refs(refPrefix: "refs/heads/release/", first: 100, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+            nodes { name target { ... on Commit { committedDate } } } } } }'
+        mapfile -t names < <(gh api graphql -F owner="${PI_REPO%%/*}" -F name="${PI_REPO#*/}" -f query="$query" \
+          --jq '.data.repository.refs.nodes | sort_by(.target.committedDate) | reverse | .[].name' | head -n "$COUNT")
+        refs=()
+        specs=()
+        for name in "${names[@]}"; do
+          [ -n "$name" ] || continue
+          specs+=("+refs/heads/release/${name}:refs/remotes/origin/release/${name}")
+          refs+=("origin/release/${name}")
+        done
+        if [ "${#specs[@]}" -gt 0 ]; then
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth#AUTHORIZATION: basic }"
+          git -c http.https://github.com/.extraheader= -c "http.https://github.com/.extraheader=${auth}" \
+            fetch --no-tags --depth=1 origin "${specs[@]}"
+        fi
+        echo "refs=${refs[*]}" >> "$GITHUB_OUTPUT"
+
+    - name: Prefetch Sentry context
+      if: ${{ steps.gate.outputs.run == 'true' && inputs.sentry-auth-token != '' && inputs.sentry-base-url != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_IN: ${{ steps.gate.outputs.in }}
+        SENTRY_AUTH_TOKEN: ${{ inputs.sentry-auth-token }}
+        SENTRY_BASE_URL: ${{ inputs.sentry-base-url }}
+        SENTRY_ORG: ${{ inputs.sentry-org }}
+      run: |
+        set -uo pipefail
+        base="${SENTRY_BASE_URL%/}"
+        host="${base#*://}"
+        body="$(gh api "repos/${PI_REPO}/issues/${PI_ISSUE}" --jq .body)"
+        id="$(grep -oP "${host//./\\.}/[^\s)]*issues/\K[0-9]+" <<<"$body" | head -1 || true)"
+        [ -n "$id" ] || { echo "No Sentry issue linked."; exit 0; }
+        api="${base}/api/0/organizations/${SENTRY_ORG}/issues/${id}"
+        auth=(-H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}")
+        curl -sf "${auth[@]}" "${api}/" \
+          | jq '{title, shortId, level, status, count, userCount, firstSeen, lastSeen, culprit, metadata, project: .project.slug}' \
+          | head -c 51200 > "${PI_IN}/sentry-issue.json" \
+          || echo "::warning title=pi-issue-triage::Could not fetch Sentry issue ${id}."
+        curl -sf "${auth[@]}" "${api}/events/latest/" \
+          | jq '{title, platform, entries: [.entries[] | select(.type == "exception" or .type == "spans" or .type == "request")], tags: [.tags[] | select(.key == "transaction" or .key == "url" or .key == "server_name" or .key == "release")]}' \
+          | head -c 51200 > "${PI_IN}/sentry-event.json" \
+          || echo "::warning title=pi-issue-triage::Could not fetch the latest Sentry event for ${id}."
+        exit 0
+
+    - name: Install pi
+      if: ${{ steps.gate.outputs.run == 'true' }}
+      shell: bash
+      env:
+        PI_VERSION: ${{ inputs.pi-version }}
+        PROVIDER_EXTENSION_VERSION: ${{ inputs.provider-extension-version }}
+      run: bash "${{ github.action_path }}/../lib/install-pi.sh"
+
+    - name: Triage with Pi
+      id: pi
+      if: ${{ steps.gate.outputs.run == 'true' }}
+      shell: bash
+      env:
+        PI_ACTION_PROMPT: >-
+          Triage issue #${{ inputs.issue-number }} in ${{ inputs.repository }} following the
+          issue-triage skill. Write triage.md and result.json to the directory in $PI_OUT.
+        PI_ACTION_PROMPT_FILE: ''
+        PI_ACTION_SKILL: ${{ github.action_path }}/skill
+        PI_ACTION_APPEND_SYSTEM_PROMPT: ''
+        PI_ACTION_MODEL: ${{ inputs.model }}
+        PI_ACTION_FALLBACK_MODELS: ${{ inputs.fallback-models }}
+        PI_ACTION_THINKING: ${{ inputs.thinking }}
+        PI_ACTION_TOOLS: read,bash,grep,find,ls,write
+        PI_ACTION_MAX_TURNS: ${{ inputs.max-turns }}
+        PI_ACTION_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        PI_ACTION_ON_RATE_LIMIT: ${{ inputs.on-rate-limit }}
+        PI_ACTION_CPA_API_KEY: ${{ inputs.cliproxyapi-api-key }}
+        PI_ACTION_CPA_BASE_URL: ${{ inputs.cliproxyapi-base-url }}
+        PI_ACTION_EXTENSION_DIR: ${{ runner.temp }}/pi-ext
+        PI_ACTION_GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        PI_ACTION_BOT_LOGIN: ''
+        PI_ACTION_BOT_EMAIL: ''
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_IN: ${{ steps.gate.outputs.in }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_RELEASE_REFS: ${{ steps.refs.outputs.refs }}
+        PI_MAX_NEW_ISSUES: ${{ inputs.max-new-issues }}
+      run: node "${{ github.action_path }}/../runner.mjs"
+
+    - name: Mint issues:write token
+      id: write-token
+      if: ${{ steps.gate.outputs.run == 'true' && steps.pi.outcome == 'success' && steps.pi.outputs.rate-limited != 'true' && inputs.dry-run != 'true' }}
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ steps.gate.outputs.owner }}
+        repositories: ${{ steps.gate.outputs.name }}
+        permission-issues: write
+
+    - name: Apply triage
+      id: apply
+      if: ${{ steps.gate.outputs.run == 'true' && steps.pi.outcome == 'success' && steps.pi.outputs.rate-limited != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.write-token.outputs.token || steps.read-token.outputs.token }}
+        PI_REPO: ${{ inputs.repository }}
+        PI_ISSUE: ${{ inputs.issue-number }}
+        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug }}[bot]
+        PI_DRY_RUN: ${{ inputs.dry-run }}
+        PI_MAX_NEW_ISSUES: ${{ inputs.max-new-issues }}
+        PI_FIX_LABEL: ${{ inputs.fix-label }}
+        PI_REMOVE_LABELS: ${{ inputs.remove-labels }}
+        PI_MODEL_USED: ${{ steps.pi.outputs.model-used }}
+      run: node "${{ github.action_path }}/apply.mjs"
+
+    - name: Upload transcript
+      if: ${{ always() && inputs.upload-transcript == 'true' && steps.pi.outputs.transcript != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: pi-triage-${{ inputs.issue-number }}-${{ github.run_attempt }}
+        path: |
+          ${{ steps.pi.outputs.transcript }}
+          ${{ steps.gate.outputs.out }}
+        if-no-files-found: warn
+        retention-days: 30
