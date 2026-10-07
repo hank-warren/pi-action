@@ -62,6 +62,12 @@ newest stays expanded. See [`examples/workflows/pi-review.yml`](examples/workflo
   *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*; without
   it an approval is posted as a comment and this identity's earlier "changes requested" is dismissed
   instead, so a fixed PR is never left blocked.
+- **Trust model: same-repo PRs only.** Run it on `pull_request`, never on `pull_request_target` with
+  the PR's code checked out. The agent can read its own environment, so a prompt-injected PR can get
+  the gateway key into what the model sees. The runner redacts the key and the agent's token from the
+  transcript, outputs and summary, and the post step refuses a body containing either, but a model
+  can re-encode a value it has seen. Under `pull_request` that adds no exposure: fork PRs get no
+  secrets, and a same-repo author can already read them by editing a workflow.
 - **`mode: comment`** posts the same review as a plain comment that never approves or blocks.
 - Repos can add `.github/pi/review.md` with what matters (and what to ignore) locally; the skill reads
   it along with `AGENTS.md`/`CLAUDE.md`. `dry-run: true` writes the planned review to the step
