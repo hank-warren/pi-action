@@ -10,11 +10,12 @@ Blocking, in this repo:
   directly into a `run:` script. Untrusted values must reach scripts through `env:`.
 - **Credential exposure.** The gateway key or a GitHub token reaching the agent when it should not,
   appearing in logs or step summaries, or `runner.mjs` setting `ANTHROPIC_*`/`OPENAI_*` credentials.
-  Agents in `issue-triage`, `issue-fix` and `pr-review` must never hold a write token.
+  Agents in `issue-triage`, `issue-fix` and `pr-review` must never hold a write token, and the
+  `pr-review` agent's default tools must stay read-only (a write tool could rewrite the post step).
 - **Wiring drift.** A `PI_ACTION_*` variable the runner reads that some `action.yml` does not pass,
   or `pi-version` / `provider-extension-version` defaults that differ between actions.
 - **Apply-step limits.** Anything that lets agent output bypass the deterministic limits: draft-only
-  PRs, existing labels only, capped follow-up issues, one review per run, paths escaping `$PI_OUT`.
+  PRs, existing labels only, capped follow-up issues, one review per run, paths escaping an output directory.
 - **Exit semantics.** A path where the runner exits 0 on a real failure, or fails on quota exhaustion
   under `on-rate-limit: skip`.
 

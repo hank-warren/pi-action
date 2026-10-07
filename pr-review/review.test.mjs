@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { REVIEW_MARKER, buildBody, planReview, staleBlockingReviews, supersededReviews } from "./review.mjs";
+import { REVIEW_MARKER, buildBody, leakedSecrets, parseResult, planReview, staleBlockingReviews, supersededReviews } from "./review.mjs";
+
+test("parseResult reads the verdict line and the body after it", () => {
+  assert.deepEqual(parseResult("VERDICT: approve"), { verdict: "approve", report: "" });
+  assert.deepEqual(parseResult("Done reviewing.\n\n**VERDICT:** Request-Changes\n\n**Findings**\n\n1. `a.js:3`: boom\n"), {
+    verdict: "request-changes",
+    report: "**Findings**\n\n1. `a.js:3`: boom",
+  });
+  assert.equal(parseResult("Verdict: `approve`.").verdict, "approve");
+  assert.throws(() => parseResult("Looks good to me."), /no VERDICT line/);
+  assert.throws(() => parseResult(undefined), /no VERDICT line/);
+});
 
 test("planReview maps verdicts to events in verdict mode", () => {
   assert.deepEqual(planReview({ verdict: "approve" }, "verdict"), { verdict: "approve", event: "APPROVE" });
@@ -58,4 +69,11 @@ test("staleBlockingReviews picks this identity's marked change requests", () => 
     ["a"],
   );
   assert.deepEqual(staleBlockingReviews(undefined, "e"), []);
+});
+
+test("leakedSecrets finds guarded credentials and ignores blanks", () => {
+  const list = "\nabcdef0123456789\n  \nghs_shorttoken1\n";
+  assert.deepEqual(leakedSecrets("key is abcdef0123456789 lol", list), ["abcdef0123456789"]);
+  assert.deepEqual(leakedSecrets("nothing here", list), []);
+  assert.deepEqual(leakedSecrets("x", undefined), []);
 });

@@ -1,36 +1,40 @@
 #!/usr/bin/env node
 /**
- * Post the review the agent wrote to $PI_OUT: exactly one review, pinned to the
+ * Post the review from the agent's final message: exactly one review, pinned to the
  * commit that was reviewed, then collapse this identity's older Pi reviews. When
  * a newer non-approving review replaces a blocking one, the old block is
  * dismissed so it cannot outlive the findings. With PI_DRY_RUN=true nothing is
  * written; the plan goes to the step summary.
  */
 
-import { api, env, fail, readOutput, readResult, run, setOutput, summary, warn } from "../lib/common.mjs";
-import { buildBody, planReview, staleBlockingReviews, supersededReviews } from "./review.mjs";
+import { api, env, fail, run, setOutput, summary, warn } from "../lib/common.mjs";
+import { buildBody, leakedSecrets, parseResult, planReview, staleBlockingReviews, supersededReviews } from "./review.mjs";
 
 const TITLE = "pi-pr-review";
 
 const repo = env("PI_REPO");
 const pr = Number.parseInt(env("PI_PR"), 10);
-const outDir = env("PI_OUT");
 const headSha = env("PI_HEAD_SHA");
 const mode = env("PI_REVIEW_MODE", "verdict");
 const dryRun = env("PI_DRY_RUN") === "true";
 const model = env("PI_MODEL_USED");
 
-if (!repo || !Number.isInteger(pr) || !outDir || !headSha) {
-  fail(TITLE, "PI_REPO, PI_PR, PI_OUT and PI_HEAD_SHA are required.");
+if (!repo || !Number.isInteger(pr) || !headSha) {
+  fail(TITLE, "PI_REPO, PI_PR and PI_HEAD_SHA are required.");
 }
 
 let plan;
 let body;
 try {
-  plan = planReview(readResult(outDir), mode);
-  body = buildBody({ verdict: plan.verdict, report: readOutput(outDir, "review.md"), model });
+  const result = parseResult(process.env.PI_RESULT);
+  plan = planReview(result, mode);
+  body = buildBody({ verdict: plan.verdict, report: result.report, model });
 } catch (error) {
   fail(TITLE, `The agent did not produce a usable review: ${error.message}`);
+}
+// The agent can read its own environment; prompt-injected PR text must not get a credential posted.
+if (leakedSecrets(body, process.env.PI_GUARDED_SECRETS).length) {
+  fail(TITLE, "The review body contains a credential the agent could read; refusing to post it.");
 }
 setOutput("verdict", plan.verdict);
 

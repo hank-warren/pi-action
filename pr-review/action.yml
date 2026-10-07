@@ -6,10 +6,12 @@ branding:
   icon: 'eye'
   color: 'purple'
 
-# The agent never writes to GitHub. The action prefetches the PR (metadata,
-# diff, earlier reviews) into a directory, the agent reads that and the checkout
-# and writes review.md + result.json, and a separate step posts exactly one
-# review pinned to the reviewed commit and collapses this identity's older ones.
+# The agent never writes to GitHub, or to disk. The action prefetches the PR
+# (metadata, diff, earlier reviews) into a directory, the agent reads that and
+# the checkout with read-only tools and answers with its verdict as its final
+# message, and a separate step posts exactly one review pinned to the reviewed
+# commit and collapses this identity's older ones. Without a write tool the
+# agent cannot alter the scripts that later run with the write token.
 #
 # Check out the PR before this action (actions/checkout on a pull_request event
 # does), ideally with `persist-credentials: false`.
@@ -25,6 +27,12 @@ inputs:
     description: 'Pull request to review.'
     required: false
     default: ${{ github.event.pull_request.number }}
+  head-sha:
+    description: >-
+      Head commit the checkout was made from. The review is skipped when the PR's live head differs,
+      so the files on disk always match the diff being reviewed. Empty reviews the live head.
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
   repository:
     description: 'owner/name of the pull request''s repository. The checkout in the working directory must be this repository.'
     required: false
@@ -68,10 +76,11 @@ inputs:
     default: 'high'
   tools:
     description: >-
-      Agent tool allowlist. The default has no bash: everything the review needs is prefetched, and
-      bash would expose the gateway key to commands the model runs. Add bash only for trusted PRs.
+      Agent tool allowlist. The default is read-only: everything the review needs is prefetched. Adding
+      bash exposes the gateway key to commands the model runs, and bash or write lets prompt-injected
+      PR text alter the post step that runs with the write token. Widen it only for trusted PRs.
     required: false
-    default: 'read,grep,find,ls,write'
+    default: 'read,grep,find,ls'
   max-turns:
     description: 'Assistant turn cap.'
     required: false
@@ -99,7 +108,7 @@ inputs:
 
 outputs:
   skipped:
-    description: '`true` when nothing ran (closed PR, or a bot-authored PR).'
+    description: '`true` when nothing ran (closed PR, bot-authored PR, or the head moved past head-sha).'
     value: ${{ steps.gate.outputs.run != 'true' }}
   verdict:
     description: '`approve` or `request-changes`, as judged by the agent.'
@@ -168,11 +177,12 @@ runs:
         GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github-token }}
         PI_REPO: ${{ inputs.repository }}
         PI_PR: ${{ inputs.pr-number }}
+        PI_EXPECTED_SHA: ${{ inputs.head-sha }}
       run: |
         set -euo pipefail
         [[ "$PI_PR" =~ ^[0-9]+$ ]] || { echo "::error title=pi-pr-review::pr-number must be a number, got '${PI_PR}'."; exit 1; }
         work="${RUNNER_TEMP}/pi-pr-review"
-        rm -rf "$work" && mkdir -p "$work/in" "$work/out"
+        rm -rf "$work" && mkdir -p "$work/in"
         gh api "repos/${PI_REPO}/pulls/${PI_PR}" --jq '{number, title, body, state, draft,
           author: .user.login, author_type: .user.type, base: .base.ref, head: .head.ref,
           head_sha: .head.sha, additions, deletions, changed_files}' > "$work/in/pr.json"
@@ -182,6 +192,8 @@ runs:
           run=false; echo "::notice title=pi-pr-review::Skipping #${PI_PR}: it is ${state}."
         elif [ "$type" != "User" ]; then
           run=false; echo "::notice title=pi-pr-review::Skipping #${PI_PR}: opened by ${login} (${type}); Pi reviews human-authored PRs only."
+        elif [ -n "$PI_EXPECTED_SHA" ] && [ "$PI_EXPECTED_SHA" != "$sha" ]; then
+          run=false; echo "::notice title=pi-pr-review::Skipping #${PI_PR}: head is ${sha:0:7}, not the checked-out ${PI_EXPECTED_SHA:0:7}; the run for the newer push reviews it."
         fi
         if [ "$run" = "true" ]; then
           gh api --paginate "repos/${PI_REPO}/pulls/${PI_PR}/files?per_page=100" \
@@ -202,7 +214,6 @@ runs:
           echo "run=${run}"
           echo "head-sha=${sha}"
           echo "in=${work}/in"
-          echo "out=${work}/out"
         } >> "$GITHUB_OUTPUT"
 
     - name: Install pi
@@ -220,7 +231,7 @@ runs:
       env:
         PI_ACTION_PROMPT: >-
           Review pull request #${{ inputs.pr-number }} in ${{ inputs.repository }} following the
-          pr-review skill. Write review.md and result.json to the directory in $PI_OUT.
+          pr-review skill, and end with your verdict message.
         PI_ACTION_PROMPT_FILE: ''
         PI_ACTION_SKILL: ${{ github.action_path }}/skill
         PI_ACTION_APPEND_SYSTEM_PROMPT: ''
@@ -243,7 +254,6 @@ runs:
         PI_REPO: ${{ inputs.repository }}
         PI_PR: ${{ inputs.pr-number }}
         PI_IN: ${{ steps.gate.outputs.in }}
-        PI_OUT: ${{ steps.gate.outputs.out }}
         PI_REVIEW_MODE: ${{ inputs.mode }}
       run: node "${{ github.action_path }}/../runner.mjs"
 
@@ -255,7 +265,11 @@ runs:
         GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github-token }}
         PI_REPO: ${{ inputs.repository }}
         PI_PR: ${{ inputs.pr-number }}
-        PI_OUT: ${{ steps.gate.outputs.out }}
+        PI_RESULT: ${{ steps.pi.outputs.result }}
+        # Credentials the agent's process could read; a body containing one is never posted.
+        PI_GUARDED_SECRETS: |
+          ${{ inputs.cliproxyapi-api-key }}
+          ${{ steps.read-token.outputs.token }}
         PI_HEAD_SHA: ${{ steps.gate.outputs.head-sha }}
         PI_REVIEW_MODE: ${{ inputs.mode }}
         PI_DRY_RUN: ${{ inputs.dry-run }}
@@ -267,8 +281,6 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: pi-review-${{ inputs.pr-number }}-${{ github.run_attempt }}
-        path: |
-          ${{ steps.pi.outputs.transcript }}
-          ${{ steps.gate.outputs.out }}
+        path: ${{ steps.pi.outputs.transcript }}
         if-no-files-found: warn
         retention-days: 30

@@ -50,11 +50,13 @@ newest stays expanded. See [`examples/workflows/pi-review.yml`](examples/workflo
 
 - **Models:** `cpa/gpt-6.1-sol`, falling back to `cpa/claude-opus-5-5` on quota exhaustion or an
   unavailable model, with `thinking: high`. Out of quota on both posts nothing and exits 0.
-- **The agent never writes to GitHub.** The action prefetches the PR's metadata, diff and earlier
-  reviews into files; the agent reads those and the checkout and writes a verdict plus a review body.
-  A deterministic step posts exactly one review, pinned to the reviewed commit, and posts nothing if
-  the PR moved on meanwhile. The default tool set has no `bash`, so the model cannot run commands that
-  see the gateway key.
+- **The agent never writes to GitHub, or to disk.** The action prefetches the PR's metadata, diff and
+  earlier reviews into files; the agent reads those and the checkout with read-only tools
+  (`read,grep,find,ls`) and answers with a verdict plus a review body. A deterministic step posts
+  exactly one review, pinned to the reviewed commit. With no `write` or `bash`, prompt-injected PR
+  text cannot alter that step or reach the gateway key.
+- **Reviews the commit on disk.** When the PR's head has moved past the checked-out `head-sha` (a
+  push mid-run, or re-running an old workflow), the run skips and the newer push's run reviews it.
 - **Identity:** `github-token` (default `GITHUB_TOKEN`, `github-actions[bot]`) or an App via
   `app-client-id` / `app-private-key`. `GITHUB_TOKEN` can only approve when the repo enables
   *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*; without
