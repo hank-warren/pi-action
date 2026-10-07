@@ -218,6 +218,12 @@ if (botLogin && botEmail) {
 }
 const identity = botLogin || (ghToken ? "github-token" : "github-actions");
 
+// The agent can read its own environment (e.g. /proc/self/environ), so tool output may carry these.
+// Redact them before anything reaches the transcript artifact (public on a public repo), outputs or
+// the step summary.
+const guardedSecrets = [cpaApiKey, ghToken].filter((value) => value && value.length >= 8);
+const redact = (text) => guardedSecrets.reduce((out, secret) => out.replaceAll(secret, "[REDACTED]"), text);
+
 // Isolate the agent dir so no ambient ~/.pi state (settings, skills, stored
 // credentials) can outrank what this action passes explicitly.
 const runnerTemp = process.env.RUNNER_TEMP || process.env.TMPDIR || "/tmp";
@@ -387,7 +393,8 @@ function runAttempt(model, attempt) {
       }
     }
 
-    readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => {
+    readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (raw) => {
+      const line = redact(raw);
       transcript.write(`${line}\n`);
       if (!line.trim()) return;
       let event;
@@ -400,7 +407,7 @@ function runAttempt(model, attempt) {
     });
 
     child.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
+      const text = redact(chunk.toString());
       stderrChunks.push(text);
       process.stderr.write(text);
     });

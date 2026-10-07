@@ -80,6 +80,7 @@ summary(`Posted ${event}: ${review.html_url ?? ""}`);
 
 // Cleanup is best-effort: a failure here never un-posts the review.
 try {
+  // PullRequestReview implements Minimizable: it has isMinimized and is a valid minimizeComment subject.
   const [owner, name] = repo.split("/");
   const query = `query($owner: String!, $name: String!, $pr: Int!) {
     repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
