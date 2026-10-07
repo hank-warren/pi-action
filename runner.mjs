@@ -218,6 +218,13 @@ if (botLogin && botEmail) {
 }
 const identity = botLogin || (ghToken ? "github-token" : "github-actions");
 
+// The agent can read its own environment (e.g. /proc/self/environ), so tool output may carry these.
+// Redact them before anything reaches the transcript artifact (public on a public repo), outputs or
+// the step summary.
+const STREAMING_EVENTS = new Set(["message_update", "tool_execution_update"]);
+const guardedSecrets = [cpaApiKey, ghToken].filter((value) => value && value.length >= 8);
+const redact = (text) => guardedSecrets.reduce((out, secret) => out.replaceAll(secret, "[REDACTED]"), text);
+
 // Isolate the agent dir so no ambient ~/.pi state (settings, skills, stored
 // credentials) can outrank what this action passes explicitly.
 const runnerTemp = process.env.RUNNER_TEMP || process.env.TMPDIR || "/tmp";
@@ -387,20 +394,22 @@ function runAttempt(model, attempt) {
       }
     }
 
-    readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => {
-      transcript.write(`${line}\n`);
-      if (!line.trim()) return;
+    readline.createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (raw) => {
+      const line = redact(raw);
       let event;
       try {
-        event = JSON.parse(line);
+        event = line.trim() ? JSON.parse(line) : undefined;
       } catch {
-        return; // non-JSON noise on stdout is recorded but not interpreted
+        event = undefined; // non-JSON noise on stdout is recorded but not interpreted
       }
-      handleEvent(event);
+      // Streaming records are deltas, so a credential split across two of them escapes per-line
+      // redaction. message_end and tool_execution_end carry the complete, redacted content.
+      if (!STREAMING_EVENTS.has(event?.type)) transcript.write(`${line}\n`);
+      if (event) handleEvent(event);
     });
 
     child.stderr.on("data", (chunk) => {
-      const text = chunk.toString();
+      const text = redact(chunk.toString());
       stderrChunks.push(text);
       process.stderr.write(text);
     });

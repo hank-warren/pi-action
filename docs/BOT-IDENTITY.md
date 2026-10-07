@@ -48,6 +48,7 @@ The App's grant is a ceiling, not what each job gets. Every token is minted scop
 | Root action (reviews), default | read | read | write |
 | `issue-triage` agent / apply step | read / — | read / write | read / — |
 | `issue-fix` agent / apply step | read / write | read / write | read / write |
+| `pr-review` agent / post step | read / read | read / — | read / write |
 
 The agent in `issue-triage` and `issue-fix` only ever holds the read-only token. Writes happen in a
 separate deterministic step after the agent exits, which is what guarantees Pi PRs are always drafts.

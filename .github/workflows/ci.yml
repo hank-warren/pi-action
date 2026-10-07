@@ -21,7 +21,7 @@ jobs:
       - name: Syntax check scripts
         run: |
           set -euo pipefail
-          for file in runner.mjs lib/*.mjs issue-*/apply.mjs; do node --check "$file"; done
+          for file in runner.mjs lib/*.mjs */apply.mjs pr-review/review.mjs; do node --check "$file"; done
 
       - name: Unit tests
         run: node --test
@@ -35,7 +35,7 @@ jobs:
             const used = [...new Set([...runner.matchAll(/input\("(PI_ACTION_[A-Z_]+)"\)/g)].map((m) => m[1]))];
             const versionOf = (src, input) => (src.match(new RegExp(input + ":[\\s\\S]*?default: .([0-9.]+).")) || [])[1];
             const root = fs.readFileSync("action.yml", "utf8");
-            for (const file of ["action.yml", "issue-triage/action.yml", "issue-fix/action.yml"]) {
+            for (const file of ["action.yml", "issue-triage/action.yml", "issue-fix/action.yml", "pr-review/action.yml"]) {
               const src = fs.readFileSync(file, "utf8");
               for (const key of ["name:", "description:", "runs:", "using: composite"]) {
                 if (!src.includes(key)) throw new Error(file + " missing " + key);
