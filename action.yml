@@ -118,11 +118,11 @@ inputs:
   pi-version:
     description: 'Pinned @earendil-works/pi-coding-agent version.'
     required: false
-    default: '1.0.0'
+    default: '1.1.0'
   provider-extension-version:
     description: 'Pinned @hank-warren/pi-cliproxyapi-provider version.'
     required: false
-    default: '0.2.2'
+    default: '0.4.0'
   upload-transcript:
     description: 'Upload the full JSONL session transcript as a workflow artifact.'
     required: false

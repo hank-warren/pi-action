@@ -275,6 +275,8 @@ const baseArgs = [
   "--no-skills",
   "--no-prompt-templates",
   "--no-context-files",
+  // pi 1.0.4+ keeps MCP tools under --tools; the action never wants them.
+  "--no-mcp",
   "--extension",
   extensionEntry,
 ];
