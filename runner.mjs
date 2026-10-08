@@ -16,6 +16,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
+import { planModelChain } from "./lib/models.mjs";
+
 // The extension registers models under this provider name: `cpa/<model-id>`.
 const PROVIDER_NAME = "cpa";
 
@@ -168,18 +170,18 @@ try {
 } catch (error) {
   fail(`Gateway unreachable at ${cpaBaseUrl}/models: ${error instanceof Error ? error.message : String(error)}`);
 }
-// A model the gateway does not list (disabled, excluded, or no usable
-// credential) is skipped in favour of the next one in the chain.
-const servedIds = new Set(gatewayModels.map((entry) => entry.id));
-const runnableModels = modelChain.filter((model) => servedIds.has(modelIdOf(model)));
-if (runnableModels.length === 0) {
-  fail(
-    `None of ${modelChain.join(", ")} is served by the gateway. Available: ` +
-      [...servedIds].sort().join(", "),
+// Every model in the chain is tried, listed or not: CLIProxyAPI hides a model
+// it has suspended, and only a request through it clears that (lib/models.mjs).
+// An unlisted model gets a synthetic snapshot entry so pi resolves it with real
+// metadata; one the gateway really cannot serve fails fast on its first request
+// and the attempt loop falls back.
+const { unlisted: unlistedIds, snapshot: snapshotModels } = planModelChain(modelChain.map(modelIdOf), gatewayModels);
+const unlistedModels = modelChain.filter((model) => unlistedIds.includes(modelIdOf(model)));
+for (const model of unlistedModels) {
+  warn(
+    `${model} is not listed by the gateway's /models (suspended, cooling down, disabled or unknown); ` +
+      "trying it anyway and falling back if it cannot answer.",
   );
-}
-for (const model of modelChain.filter((model) => !servedIds.has(modelIdOf(model)))) {
-  warn(`${model} is not served by the gateway (disabled or no usable credential); skipping it.`);
 }
 // Mirrors the extension's cpaModelsCachePath(): ~/.cache/pi-cliproxyapi-provider/
 // base64url("<provider>\n<baseUrl>")/cpa-models.json, envelope { fetchedAt, data }.
@@ -192,7 +194,7 @@ const snapshotDir = path.join(
 mkdirSync(snapshotDir, { recursive: true, mode: 0o700 });
 writeFileSync(
   path.join(snapshotDir, "cpa-models.json"),
-  `${JSON.stringify({ fetchedAt: Date.now(), data: gatewayModels }, null, 2)}\n`,
+  `${JSON.stringify({ fetchedAt: Date.now(), data: snapshotModels }, null, 2)}\n`,
   { mode: 0o600 },
 );
 const gatewayHost = new URL(cpaBaseUrl).host;
@@ -449,15 +451,15 @@ function runAttempt(model, attempt) {
 }
 
 const attempts = [];
-for (const [index, model] of runnableModels.entries()) {
+for (const [index, model] of modelChain.entries()) {
   process.stdout.write(
     `pi-action: model=${model} gateway=${gatewayHost} max-turns=${maxTurns} identity=${identity}` +
-      (runnableModels.length > 1 ? ` attempt=${index + 1}/${runnableModels.length}` : "") +
+      (modelChain.length > 1 ? ` attempt=${index + 1}/${modelChain.length}` : "") +
       "\n",
   );
   const result = await runAttempt(model, index + 1);
   attempts.push(result);
-  const next = runnableModels[index + 1];
+  const next = modelChain[index + 1];
   const reason = result.quotaExhausted ? "quota exhausted" : result.modelUnavailable ? "model unavailable" : "";
   if (reason && next && Date.now() < deadline) {
     warn(`${model}: ${reason}; falling back to ${next}. ${result.finalError.slice(0, 200)}`);
@@ -479,24 +481,23 @@ summary(
   `| | |\n|---|---|\n| Model | \`${final.model}\` |\n| Gateway | ${gatewayHost} |\n| Identity | ${identity} |\n` +
     `| Turns | ${final.turns} / ${maxTurns} |\n| Retries | ${final.retries} |\n| Tool calls | ${final.toolCalls.length} |`,
 );
-if (attempts.length > 1 || runnableModels.length < modelChain.length) {
+if (attempts.length > 1 || unlistedModels.length > 0) {
   summary("");
   summary("**Model chain**");
   summary("");
   for (const model of modelChain) {
     const result = attempts.find((attempt) => attempt.model === model);
-    const outcome = !runnableModels.includes(model)
-      ? "skipped: not served by the gateway"
-      : !result
-        ? "not tried"
-        : result.quotaExhausted
-          ? "quota exhausted"
-          : result.modelUnavailable
-            ? "model unavailable"
-            : result === final
-              ? "answered"
-              : "ended the run";
-    summary(`- \`${model}\`: ${outcome}`);
+    const outcome = !result
+      ? "not tried"
+      : result.quotaExhausted
+        ? "quota exhausted"
+        : result.modelUnavailable
+          ? "model unavailable"
+          : result === final
+            ? "answered"
+            : "ended the run";
+    const listing = unlistedModels.includes(model) ? "not listed by the gateway, " : "";
+    summary(`- \`${model}\`: ${listing}${outcome}`);
   }
 }
 if (final.finalText) {
@@ -523,7 +524,10 @@ if (final.quotaExhausted) {
   );
 }
 if (final.modelUnavailable) {
-  fail(`Model unavailable at the gateway${chainNote}: ${final.finalError.slice(0, 500)}`);
+  const listed = unlistedModels.includes(final.model)
+    ? ` The gateway lists: ${gatewayModels.map((entry) => entry.id).sort().join(", ")}.`
+    : "";
+  fail(`Model unavailable at the gateway${chainNote}: ${final.finalError.slice(0, 500)}${listed}`);
 }
 if (final.timedOut) {
   fail(`Agent exceeded the ${timeoutMinutes} minute timeout.`);

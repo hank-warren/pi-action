@@ -142,7 +142,7 @@ the runner writes.
 | `prompt-file` | — | Path to a file containing the prompt. |
 | `skill` | — | Skill file or directory, **one path per line**. Ambient discovery is off; only these load. |
 | `append-system-prompt` | — | Text appended to the system prompt. |
-| `model` | `cpa/claude-opus-5-5` | Gateway model, `cpa/<id>` as listed by `/v1/models`. |
+| `model` | `cpa/claude-opus-5-5` | Gateway model, `cpa/<id>`. |
 | `fallback-models` | — | Ordered fallback models, comma- or newline-separated. See [Model fallback](#model-fallback). |
 | `thinking` | — | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
 | `tools` | — | Comma-separated tool allowlist. Empty means Pi's default toolset. |
@@ -209,8 +209,11 @@ recorded in [`app-manifest.yml`](app-manifest.yml).
 
 The action walks the chain `model`, then `fallback-models` in order:
 
-- **Before running**, any model the gateway's `/models` does not list (disabled in CLIProxyAPI, or no
-  usable credential) is skipped with a warning. The step fails only if no model in the chain is served.
+- **Before running**, a model the gateway's `/models` does not list gets a warning but is still
+  tried. CLIProxyAPI hides a model while it has it suspended or cooling down on every credential, and
+  only a request through it clears that, so skipping unlisted models could pin a chain to its
+  fallback indefinitely. A model the gateway really cannot serve fails on its first request and falls
+  back as below.
 - **After a run**, if it ended because the model could not answer, the next model gets a fresh run:
 
   | Gateway response | Meaning |

@@ -29,15 +29,15 @@ inputs:
 
   # ---- Model and limits ----------------------------------------------------
   model:
-    description: 'cpa/<model-id> as listed by the gateway''s /v1/models, e.g. cpa/claude-opus-5-5.'
+    description: 'cpa/<model-id> served by the gateway, e.g. cpa/claude-opus-5-5.'
     required: false
     default: 'cpa/claude-opus-5-5'
   fallback-models:
     description: >-
       Ordered gateway models to fall back to, comma- or newline-separated, e.g.
-      cpa/gpt-6.1-sol. A model the gateway does not list is skipped up front; a run
-      that ends on quota exhaustion or an unavailable model (disabled, no usable
-      credential) is re-run from scratch on the next one. timeout-minutes covers all
+      cpa/gpt-6.1-sol. Every model is tried, even one the gateway's /models does not
+      list; a run that ends on quota exhaustion or an unavailable model (unknown,
+      disabled, no usable credential) is re-run from scratch on the next one. timeout-minutes covers all
       attempts.
     required: false
     default: ''
