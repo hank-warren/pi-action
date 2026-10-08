@@ -158,8 +158,8 @@ the runner writes.
 | `app-permission-pull-requests` | `write` | Pull requests permission of the minted App token. Empty omits it. |
 | `github-token` | — | Explicit `GH_TOKEN` for the agent. Mutually exclusive with `app-client-id`. |
 | `working-directory` | `.` | Directory the agent runs in. |
-| `pi-version` | `1.0.0` | Pinned Pi version. |
-| `provider-extension-version` | `0.2.2` | Pinned `@hank-warren/pi-cliproxyapi-provider` version. |
+| `pi-version` | `1.1.0` | Pinned Pi version. |
+| `provider-extension-version` | `0.4.0` | Pinned `@hank-warren/pi-cliproxyapi-provider` version. |
 | `upload-transcript` | `true` | Upload the JSONL transcript as an artifact. |
 | `transcript-name` | `pi-session` | Artifact name. |
 
@@ -267,7 +267,7 @@ Every run is invoked with discovery disabled and resources passed explicitly:
 
 - `--no-extensions` + an explicit `--extension` for the gateway provider only
 - `--no-skills` + explicit `--skill` paths (both flags preserve explicitly-passed paths)
-- `--no-prompt-templates`, `--no-context-files`, `--no-session`
+- `--no-prompt-templates`, `--no-context-files`, `--no-mcp`, `--no-session`
 - `PI_CODING_AGENT_DIR` pointed at a scratch directory, so no stored `~/.pi` state applies
 - Gateway connection settings passed as `CLIPROXYAPI_*` env vars, which override any
   `pi-cliproxyapi-provider` config file on a self-hosted runner
